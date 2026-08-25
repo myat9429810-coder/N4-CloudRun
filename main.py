@@ -489,15 +489,24 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, message=None, prog
         await bot.send_message(chat_id, str(e))
         
 import os
+import asyncio
 from aiohttp import web
 
 async def handle(request):
     return web.Response(text="Bot is Live!")
 
-app = web.Application()
-app.router.add_get("/", handle)
+async def start_services():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    
+    # Web Server ရော Telegram Bot ပါ ပြိုင်တူ အလုပ်လုပ်ရန်
+    await bot.infinity_polling()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    web.run_app(app, host="0.0.0.0", port=port)
-        
+    asyncio.run(start_services())
+    
