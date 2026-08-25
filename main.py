@@ -11,7 +11,7 @@ from collections import defaultdict
 # ══════════════════════════════════════════════════════
 #  CONFIG
 # ══════════════════════════════════════════════════════
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '8617073671:AAGPFpqaDEAl6FKdVHHyEuES8hJYRL5H17Y')
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '8571543186:AAFLvXgzE0ELtr5yL_bz6uL2HiDUrYYYn9s')
 GITHUB_TOKEN= " "
 ADMIN_ID = os.environ.get('ADMIN_ID', "6479920627")
 REPO_OWNER = " "
